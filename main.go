@@ -51,17 +51,9 @@ func main() {
 
 	ctx := context.Background()
 	c := newOAuthClient(ctx, config)
-	youtubeMain(c, flag.Args()[1:])
+	youtubeMain(c)
 }
-func youtubeMain(client *http.Client, argv []string) {
-	// // This section is commented because we want to start small.
-	// // We want to get to minimum testable program first.
-	// // So we're going to have it just print out broadcasts without arguments.
-	// if len(argv) < 1 {
-	// 	fmt.Fprintln(os.Stderr, "Usage: youtube filename")
-	// 	return
-	// }
-	// filename := argv[0]
+func youtubeMain(client *http.Client) {
 
 	service, err := youtube.New(client)
 	if err != nil {
@@ -117,6 +109,7 @@ func youtubeMain(client *http.Client, argv []string) {
 	log.Printf("after TRANSITION LiveBroadcast: %+v LiveBroadcastStatus: %+v", liveBroadcast, liveBroadcast.Status)
 
 	// Wait for transition to complete before transitioning to live
+	// This works well enough for now. Eventually we'll want to change this to poll for state in order to operate deterministically.
 	time.Sleep(time.Second * 15)
 
 	// TRANSITION TO LIVE
