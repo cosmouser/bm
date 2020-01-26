@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/gob"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -41,17 +42,46 @@ var (
 	dbPath            = flag.String("db", "bm.db", "File path to persistent store location. The store holds the current stream information")
 	cacheToken        = flag.Bool("cachetoken", true, "cache the OAuth 2.0 token")
 	debug             = flag.Bool("debug", false, "show HTTP traffic")
+	db                *bolt.DB
+	storeBucket       = []byte("store")
+	broadcastKey      = []byte("broadcast")
 )
 
+type broadcastInfo struct {
+	ID    string         `json:"id"`
+	State broadcastState `json:"state"`
+	Start time.Time      `json:"start"`
+}
+type broadcastState int
+
+const (
+	BROADCAST_STARTING broadcastState = 0
+	BROADCAST_LIVE     broadcastState = 1
+	BROADCAST_ERROR    broadcastState = 2
+)
+
+func (b broadcastState) String() string {
+	switch b {
+	case 0:
+		return "BROADCAST_STARTING"
+	case 1:
+		return "BROADCAST_LIVE"
+	case 2:
+		return "BROADCAST_ERROR"
+	default:
+		return "BROADCAST_UNKNOWN"
+	}
+}
 func main() {
 	flag.Parse()
 
-	db, err := bolt.Open(*dbPath, 0600, nil)
+	var err error
+	db, err = bolt.Open(*dbPath, 0600, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	initLocalStore(db)
+	initLocalStore()
 	config := &oauth2.Config{
 		ClientID:     valueOrFileContents(*clientID, *clientIDFile),
 		ClientSecret: valueOrFileContents(*secret, *secretFile),
@@ -64,18 +94,55 @@ func main() {
 	youtubeMain(c)
 }
 
-// checkLocalState checks the internal store for the LiveBroadcast status.
+// findState checks the internal store for the LiveBroadcast status.
 // If the internal store matches YT's data then it resumes managing the current
 // stream. If it does not match, or if there is no internal data, this
 // starts a new broadcast.
-func checkLocalState(svc *youtube.LiveBroadcastsService) error {
-	return nil
+func findState(svc *youtube.Service) (broadcastState, error) {
+	state := BROADCAST_STARTING
+	err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(storeBucket)
+		v := b.Get(broadcastKey)
+		// if v doesn't exist v will be nil
+		// if nil, retain state as BROADCAST_STARTING
+		if v == nil {
+			return nil
+		}
+		broadcast := broadcastInfo{}
+		err := json.Unmarshal(v, &broadcast)
+		if err != nil {
+			return err
+		}
+		if broadcast.ID == "" {
+			return nil
+		}
+		lbs := youtube.NewLiveBroadcastsService(svc)
+		lbslc := lbs.List("snippet,contentDetails,status")
+		resp, err := lbslc.BroadcastStatus("active").Do()
+		if err != nil {
+			log.Error(err)
+		}
+		if len(resp.Items) == 0 {
+			return nil
+		}
+		for _, v := range resp.Items {
+			if v.Id == broadcast.ID {
+				state = BROADCAST_LIVE
+			} else {
+				log.WithFields(log.Fields{
+					"liveBroadcastId": v.Id,
+				}).Info("Found unmanaged active broadcast")
+			}
+		}
+		return nil
+	})
+	return state, err
 }
 
 // pollAndTransitionToLive polls the current LiveBroadcast for ready status, then
 // calls for a transition to "live" status.
 func pollAndTransitionToLive(svc *youtube.LiveBroadcastsService) {}
-func initLocalStore(db *bolt.DB) {
+func initLocalStore() {
 	db.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte("store"))
 		if err != nil {
@@ -86,26 +153,66 @@ func initLocalStore(db *bolt.DB) {
 	})
 }
 func youtubeMain(client *http.Client) {
-
 	service, err := youtube.New(client)
 	if err != nil {
 		log.Fatalf("Unable to create YouTube service: %v", err)
 	}
-	lss := youtube.NewLiveStreamsService(service)
+	errCount := 0
+	for !liveStreamHealthCheck(service) {
+		if errCount < 4 {
+			errCount++
+		}
+		time.Sleep(time.Duration(15*errCount) * time.Second)
+	}
+	state, err := findState(service)
+	if err != nil {
+		log.Fatalf("Error checking state: %v", err)
+	}
+	// If state is BROADCAST_STARTING, run steps to insert a new broadcast
+	// If state is BROADCAST_LIVE, go to regular status polling
+	// If state is BROADCAST_ERROR, stream is bad or unable to auth.
+	// Attempt to end stream if local ID matches external ID, then change status
+	// to BROADCAST_STARTING.
+	// If unable to end the stream, keep trying at regular intervals.
+	// With the application kept in the BROADCAST_ERROR state, prometheus
+	// should be able to alert on a problem. We don't want to start a new stream
+	// because we want to make sure the old one has been ended.
+	log.WithFields(log.Fields{
+		"state": state,
+	}).Info()
+	if state == BROADCAST_STARTING {
+		insertBroadcast(service)
+	}
+
+}
+func liveStreamHealthCheck(svc *youtube.Service) bool {
+	lss := youtube.NewLiveStreamsService(svc)
 	lslc := lss.List("snippet,cdn,contentDetails,status")
 	resp, err := lslc.Id(valueOrFileContents("", *streamIDFile)).Do()
 	if err != nil {
-		log.Fatalf("Error making YouTube API call: %v", err)
+		log.WithFields(log.Fields{
+			"error": err,
+		}).Fatal("Error checking liveStream health")
 	}
-	log.Printf("%+v", resp.Items[0].Id)
-	log.Printf("%+v", resp.Items[0].Snippet)
-	log.Printf("%+v", resp.Items[0].Status.HealthStatus)
-	for _, v := range resp.Items[0].Status.HealthStatus.ConfigurationIssues {
-		log.Printf("Configuration issue: %+v", v)
+	if len(resp.Items) == 0 {
+		log.WithFields(log.Fields{
+			"streamID": valueOrFileContents("", *streamIDFile),
+		}).Fatal("Stream not found")
 	}
-	log.Printf("%+v", resp.Items[0].ContentDetails)
+	if len(resp.Items[0].Status.HealthStatus.ConfigurationIssues) != 0 {
+		for _, v := range resp.Items[0].Status.HealthStatus.ConfigurationIssues {
+			log.Error(v.Description)
+		}
+		log.WithFields(log.Fields{
+			"streamID": valueOrFileContents("", *streamIDFile),
+		}).Error("The stream does not seem healthy")
+		return false
+	}
+	return true
 }
-func insertBroadcast(svc *youtube.LiveBroadcastsService) (*youtube.LiveBroadcast, error) {
+
+func insertBroadcast(svc *youtube.Service) {
+	liveBroadcastService := youtube.NewLiveBroadcastsService(svc)
 	broadcastInput := &youtube.LiveBroadcast{
 		ContentDetails: &youtube.LiveBroadcastContentDetails{
 			EnableDvr:       true,
@@ -119,21 +226,30 @@ func insertBroadcast(svc *youtube.LiveBroadcastsService) (*youtube.LiveBroadcast
 			SelfDeclaredMadeForKids: false,
 		},
 		Snippet: &youtube.LiveBroadcastSnippet{
-			Title:              valueOrFileContents(*broadcastName, *broadcastNameFile) + " | " + time.Now().Format(time.RubyDate),
+			Title:              valueOrFileContents(*broadcastName, *broadcastNameFile) + " | " + time.Now().Format(time.RFC3339),
 			Description:        "Live stream by BroadcastManager",
 			ScheduledStartTime: time.Now().Format(time.RFC3339),
 		},
 	}
-
-	insertCall := svc.Insert("snippet,contentDetails,status", broadcastInput)
-	return insertCall.Do()
-}
-func testInsertBroadcastAndGoLive(svc *youtube.Service) {
-	liveBroadcastService := youtube.NewLiveBroadcastsService(svc)
-	liveBroadcast, err := insertBroadcast(liveBroadcastService)
+	insertCall := liveBroadcastService.Insert("snippet,contentDetails,status", broadcastInput)
+	liveBroadcast, err := insertCall.Do()
 	if err != nil {
 		log.Fatalf("Error making YouTube API call: %v", err)
 	}
+	db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(storeBucket)
+		dat := broadcastInfo{
+			ID:    liveBroadcast.Id,
+			State: BROADCAST_STARTING,
+			Start: time.Now(),
+		}
+		serial, err := json.Marshal(dat)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = b.Put(broadcastKey, serial)
+		return err
+	})
 	// DEBUG
 	log.Printf("after INSERT LiveBroadcast: %+v LiveBroadcastStatus: %+v", liveBroadcast, liveBroadcast.Status)
 
@@ -144,6 +260,20 @@ func testInsertBroadcastAndGoLive(svc *youtube.Service) {
 		log.Fatalf("Error making YouTube API call: %v", err)
 	}
 	log.Printf("after BIND LiveBroadcast: %+v LiveBroadcastStatus: %+v", liveBroadcast, liveBroadcast.Status)
+	for {
+		time.Sleep(5 * time.Second)
+		lc := liveBroadcastService.List("snippet,contentDetails,status")
+		resp, err := lc.BroadcastStatus("upcoming").Do()
+		if err != nil {
+			log.Fatalf("Error making YouTube API call: %v", err)
+		}
+		if len(resp.Items) == 0 {
+			log.Warn("No items found in liveBroadcast list response")
+			continue
+		}
+		log.Printf("LiveBroadcast: %+v", resp.Items[0])
+		log.Printf("LiveBroadcast.Status: %+v", resp.Items[0].Status)
+	}
 
 	// TRANSITION TO TESTING
 	transitionCall := liveBroadcastService.Transition("testing", liveBroadcast.Id, "snippet,status")
