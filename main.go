@@ -93,7 +93,7 @@ func youtubeMain(client *http.Client) {
 	}
 	lss := youtube.NewLiveStreamsService(service)
 	lslc := lss.List("snippet,cdn,contentDetails,status")
-	resp, err := lslc.Id("gjjfl3sUhhQ0Mfkxju5Mkg1579286304556586").Do()
+	resp, err := lslc.Id(valueOrFileContents("", *streamIDFile)).Do()
 	if err != nil {
 		log.Fatalf("Error making YouTube API call: %v", err)
 	}
@@ -104,7 +104,6 @@ func youtubeMain(client *http.Client) {
 		log.Printf("Configuration issue: %+v", v)
 	}
 	log.Printf("%+v", resp.Items[0].ContentDetails)
-
 }
 func insertBroadcast(svc *youtube.LiveBroadcastsService) (*youtube.LiveBroadcast, error) {
 	broadcastInput := &youtube.LiveBroadcast{
