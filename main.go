@@ -36,16 +36,16 @@ var (
 	secretFile = flag.String("secret-file", "clientsecret.dat",
 		"Name of a file containing just the project's OAuth 2.0 Client Secret from https://developers.google.com/console.")
 	streamIDFile      = flag.String("streamid-file", "streamid.dat", "Name of a file containing just the YouTube LiveStream ID to use.")
+	broadcastDuration = flag.Int("broadcast-duration", 30, "Number of minutes per broadcast")
 	broadcastName     = flag.String("broadcastname", "", "Name to use for the broadcasts. If non-empty, overrides --broadcastname-file")
 	broadcastNameFile = flag.String("broadcastname-file", "broadcastname.dat", "Name of a file containing just the name to use for the broadcasts")
-	rtspURIFile       = flag.String("rtspuri-file", "rtspuri.dat", "Name of a file containing just the name to use for the broadcasts")
 	dbPath            = flag.String("db", "bm.db", "File path to persistent store location. The store holds the current stream information")
 	cacheToken        = flag.Bool("cachetoken", true, "cache the OAuth 2.0 token")
 	debug             = flag.Bool("debug", false, "show HTTP traffic")
 	db                *bolt.DB
 	storeBucket       = []byte("store")
 	broadcastKey      = []byte("broadcast")
-	endDuration       = time.Duration(time.Hour * 6)
+	endDuration       time.Duration
 )
 
 type broadcastInfo struct {
@@ -76,7 +76,7 @@ func (b broadcastState) String() string {
 }
 func main() {
 	flag.Parse()
-
+	endDuration = time.Duration(*broadcastDuration) * time.Minutes
 	var err error
 	db, err = bolt.Open(*dbPath, 0600, nil)
 	if err != nil {
@@ -475,7 +475,7 @@ func newOAuthClient(ctx context.Context, config *oauth2.Config) *http.Client {
 		token = tokenFromWeb(ctx, config)
 		saveToken(cacheFile, token)
 	} else {
-		log.Printf("Using cached token %#v from %q", token, cacheFile)
+		log.Printf("Using cached token %#v from %q that expires at %v", token, cacheFile, token.Expiry)
 	}
 
 	return config.Client(ctx, token)
