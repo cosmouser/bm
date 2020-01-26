@@ -76,7 +76,7 @@ func (b broadcastState) String() string {
 }
 func main() {
 	flag.Parse()
-	endDuration = time.Duration(*broadcastDuration) * time.Minutes
+	endDuration = time.Duration(*broadcastDuration) * time.Minute
 	var err error
 	db, err = bolt.Open(*dbPath, 0600, nil)
 	if err != nil {
