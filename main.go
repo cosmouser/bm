@@ -55,18 +55,7 @@ func main() {
 	c := newOAuthClient(ctx, config)
 	youtubeMain(c)
 }
-func youtubeMain(client *http.Client) {
-
-	service, err := youtube.New(client)
-	if err != nil {
-		log.Fatalf("Unable to create YouTube service: %v", err)
-	}
-
-	// Test 1 - Create broadcast, bind livestream, transition to live
-	// then, transition broadcastStatus to complete
-	// if contentDetails.enableArchive and contentDetails.enableDvr were enabled
-	// the video will be saved.
-	liveBroadcastService := youtube.NewLiveBroadcastsService(service)
+func insertBroadcast(svc *youtube.LiveBroadcastsService, broadcastName, description string) (*youtube.LiveBroadcast, error) {
 	broadcastInput := &youtube.LiveBroadcast{
 		ContentDetails: &youtube.LiveBroadcastContentDetails{
 			EnableDvr:       true,
@@ -80,18 +69,41 @@ func youtubeMain(client *http.Client) {
 			SelfDeclaredMadeForKids: false,
 		},
 		Snippet: &youtube.LiveBroadcastSnippet{
-			Title:              valueOrFileContents(*broadcastName, *broadcastNameFile) + " | " + time.Now().Format(time.RubyDate),
-			Description:        "Live stream by BroadcastManager",
+			Title:              broadcastName + " | " + time.Now().Format(time.RubyDate),
+			Description:        description,
 			ScheduledStartTime: time.Now().Format(time.RFC3339),
 		},
 	}
 
-	// INSERT
-	insertCall := liveBroadcastService.Insert("snippet,contentDetails,status", broadcastInput)
-	liveBroadcast, err := insertCall.Do()
+	insertCall := svc.Insert("snippet,contentDetails,status", broadcastInput)
+	return insertCall.Do()
+}
+func youtubeMain(client *http.Client) {
+
+	service, err := youtube.New(client)
+	if err != nil {
+		log.Fatalf("Unable to create YouTube service: %v", err)
+	}
+	lss := youtube.NewLiveStreamsService(service)
+	lslc := lss.List("snippet,cdn,contentDetails,status")
+	resp, err := lslc.Mine(true).Do()
 	if err != nil {
 		log.Fatalf("Error making YouTube API call: %v", err)
 	}
+	log.Printf("%+v", resp.Items[0].Snippet)
+	log.Printf("%+v", resp.Items[0].Status.HealthStatus)
+	log.Printf("%+v", resp.Items[0].ContentDetails)
+
+}
+func testInsertBroadcastAndGoLive(svc *youtube.Service) {
+	liveBroadcastService := youtube.NewLiveBroadcastsService(svc)
+	description := "Live stream by BroadcastManager"
+	title := valueOrFileContents(*broadcastName, *broadcastNameFile)
+	liveBroadcast, err := insertBroadcast(liveBroadcastService, title, description)
+	if err != nil {
+		log.Fatalf("Error making YouTube API call: %v", err)
+	}
+	// DEBUG
 	log.Printf("after INSERT LiveBroadcast: %+v LiveBroadcastStatus: %+v", liveBroadcast, liveBroadcast.Status)
 
 	// BIND
