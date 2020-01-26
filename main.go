@@ -35,6 +35,7 @@ var (
 	streamIDFile      = flag.String("streamid-file", "streamid.dat", "Name of a file containing just the YouTube LiveStream ID to use.")
 	broadcastName     = flag.String("broadcastname", "", "Name to use for the broadcasts. If non-empty, overrides --broadcastname-file")
 	broadcastNameFile = flag.String("broadcastname-file", "broadcastname.dat", "Name of a file containing just the name to use for the broadcasts")
+	rtspURIFile       = flag.String("rtspuri-file", "rtspuri.dat", "Name of a file containing just the name to use for the broadcasts")
 	cacheToken        = flag.Bool("cachetoken", true, "cache the OAuth 2.0 token")
 	debug             = flag.Bool("debug", false, "show HTTP traffic")
 )
