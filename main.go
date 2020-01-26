@@ -45,7 +45,7 @@ var (
 	db                *bolt.DB
 	storeBucket       = []byte("store")
 	broadcastKey      = []byte("broadcast")
-	endDuration       = time.Duration(time.Minute * 30)
+	endDuration       = time.Duration(time.Hour * 6)
 )
 
 type broadcastInfo struct {
@@ -136,7 +136,7 @@ func youtubeMain(client *http.Client) {
 // broadcastManager checks the status of the current broadcast regularly to manage it
 func broadcastManager(svc *youtube.Service) {
 	c := time.Tick(15 * time.Second)
-	for now := range c {
+	for range c {
 		state := findLocalState()
 		switch state {
 		case BROADCAST_STARTING:
@@ -151,6 +151,7 @@ func broadcastManager(svc *youtube.Service) {
 				if time.Since(broadcast.Start) > 3*time.Minute {
 					log.Warn("broadcast has been in state STARTING for over 3 minutes")
 				}
+				return nil
 			})
 		case BROADCAST_LIVE:
 			shouldCheck := false
@@ -163,12 +164,13 @@ func broadcastManager(svc *youtube.Service) {
 				if err != nil {
 					return err
 				}
-				if time.Since(broadcast.LastCheck) > 2*time.Minute {
+				if time.Since(broadcast.Last) > 2*time.Minute {
 					shouldCheck = true
 				}
+				return nil
 			})
 			if shouldCheck {
-				shouldEnd := checkEndCondition()
+				shouldEnd = checkEndCondition()
 			}
 			if shouldEnd {
 				completeBroadcast(svc)
@@ -180,12 +182,41 @@ func broadcastManager(svc *youtube.Service) {
 		}
 	}
 }
-func completeBroadcast(svc *youtube.Service) {}
+func completeBroadcast(svc *youtube.Service) {
+	lbs := youtube.NewLiveBroadcastsService(svc)
+	db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(storeBucket)
+		v := b.Get(broadcastKey)
+		broadcast := broadcastInfo{}
+		err := json.Unmarshal(v, &broadcast)
+		if err != nil {
+			return err
+		}
+		transitionCall := lbs.Transition("complete", broadcast.ID, "snippet,status")
+		_, err = transitionCall.Do()
+		if err != nil {
+			log.Fatalf("Error making YouTube API call: %v", err)
+		}
+		log.WithFields(log.Fields{
+			"broadcastId": broadcast.ID,
+			"ended":       time.Now(),
+		}).Info("broadcast ended")
+		broadcast.State = BROADCAST_STARTING
+		serial, err := json.Marshal(broadcast)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = b.Put(broadcastKey, serial)
+		return nil
+	})
+	time.Sleep(15 * time.Second)
+	insertBroadcast(svc)
+}
 
 // checkEndCondition checks if the currentBroadcast has gone over the maximum duration
 func checkEndCondition() bool {
 	var result bool
-	err := db.Update(func(tx *bolt.Tx) error {
+	db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(storeBucket)
 		v := b.Get(broadcastKey)
 		if v == nil {
@@ -205,6 +236,7 @@ func checkEndCondition() bool {
 		if time.Since(broadcast.Start) > endDuration {
 			result = true
 		}
+		return nil
 	})
 	return result
 }
@@ -227,10 +259,6 @@ func liveStreamHealthCheck(svc *youtube.Service) bool {
 		for _, v := range resp.Items[0].Status.HealthStatus.ConfigurationIssues {
 			log.Error(v.Description)
 		}
-		log.WithFields(log.Fields{
-			"streamID": valueOrFileContents("", *streamIDFile),
-		}).Error("The stream does not seem healthy")
-		return false
 	}
 	return true
 }
@@ -290,6 +318,7 @@ func findLocalState() broadcastState {
 			return err
 		}
 		state = broadcast.State
+		return nil
 	})
 	return state
 }
