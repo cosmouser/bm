@@ -141,7 +141,42 @@ func findState(svc *youtube.Service) (broadcastState, error) {
 
 // pollAndTransitionToLive polls the current LiveBroadcast for ready status, then
 // calls for a transition to "live" status.
-func pollAndTransitionToLive(svc *youtube.LiveBroadcastsService) {}
+func pollForTransitionToLive(svc *youtube.LiveBroadcastsService) bool {
+	var currentBroadcastID string
+	lc := svc.List("snippet,contentDetails,status")
+	resp, err := lc.BroadcastStatus("upcoming").Do()
+	if err != nil {
+		log.Fatalf("Error making YouTube API call: %v", err)
+	}
+	if len(resp.Items) == 0 {
+		log.Warn("No upcoming liveBroadcasts found in list response")
+		return false
+	}
+	err = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(storeBucket)
+		v := b.Get(broadcastKey)
+		// if v doesn't exist v will be nil
+		// if nil, retain state as BROADCAST_STARTING
+		if v == nil {
+			return nil
+		}
+		broadcast := broadcastInfo{}
+		err := json.Unmarshal(v, &broadcast)
+		if err != nil {
+			return err
+		}
+		currentBroadcastID = broadcast.ID
+		return nil
+	})
+	for _, v := range resp.Items {
+		if v.Id == currentBroadcastID {
+			if v.Status.LifeCycleStatus == "testing" {
+				return true
+			}
+		}
+	}
+	return false
+}
 func initLocalStore() {
 	db.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte("store"))
@@ -260,20 +295,6 @@ func insertBroadcast(svc *youtube.Service) {
 		log.Fatalf("Error making YouTube API call: %v", err)
 	}
 	log.Printf("after BIND LiveBroadcast: %+v LiveBroadcastStatus: %+v", liveBroadcast, liveBroadcast.Status)
-	for {
-		time.Sleep(5 * time.Second)
-		lc := liveBroadcastService.List("snippet,contentDetails,status")
-		resp, err := lc.BroadcastStatus("upcoming").Do()
-		if err != nil {
-			log.Fatalf("Error making YouTube API call: %v", err)
-		}
-		if len(resp.Items) == 0 {
-			log.Warn("No items found in liveBroadcast list response")
-			continue
-		}
-		log.Printf("LiveBroadcast: %+v", resp.Items[0])
-		log.Printf("LiveBroadcast.Status: %+v", resp.Items[0].Status)
-	}
 
 	// TRANSITION TO TESTING
 	transitionCall := liveBroadcastService.Transition("testing", liveBroadcast.Id, "snippet,status")
@@ -284,8 +305,9 @@ func insertBroadcast(svc *youtube.Service) {
 	log.Printf("after TRANSITION LiveBroadcast: %+v LiveBroadcastStatus: %+v", liveBroadcast, liveBroadcast.Status)
 
 	// Wait for transition to complete before transitioning to live
-	// This works well enough for now. Eventually we'll want to change this to poll for state in order to operate deterministically.
-	time.Sleep(time.Second * 15)
+	for !pollForTransitionToLive(liveBroadcastService) {
+		time.Sleep(5 * time.Second)
+	}
 
 	// TRANSITION TO LIVE
 	transitionCall = liveBroadcastService.Transition("live", liveBroadcast.Id, "snippet,status")
