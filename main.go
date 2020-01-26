@@ -285,8 +285,6 @@ func insertBroadcast(svc *youtube.Service) {
 		err = b.Put(broadcastKey, serial)
 		return err
 	})
-	// DEBUG
-	log.Printf("after INSERT LiveBroadcast: %+v LiveBroadcastStatus: %+v", liveBroadcast, liveBroadcast.Status)
 
 	// BIND
 	bindCall := liveBroadcastService.Bind(liveBroadcast.Id, "snippet,contentDetails,status")
@@ -294,7 +292,6 @@ func insertBroadcast(svc *youtube.Service) {
 	if err != nil {
 		log.Fatalf("Error making YouTube API call: %v", err)
 	}
-	log.Printf("after BIND LiveBroadcast: %+v LiveBroadcastStatus: %+v", liveBroadcast, liveBroadcast.Status)
 
 	// TRANSITION TO TESTING
 	transitionCall := liveBroadcastService.Transition("testing", liveBroadcast.Id, "snippet,status")
@@ -302,7 +299,6 @@ func insertBroadcast(svc *youtube.Service) {
 	if err != nil {
 		log.Fatalf("Error making YouTube API call: %v", err)
 	}
-	log.Printf("after TRANSITION LiveBroadcast: %+v LiveBroadcastStatus: %+v", liveBroadcast, liveBroadcast.Status)
 
 	// Wait for transition to complete before transitioning to live
 	for !pollForTransitionToLive(liveBroadcastService) {
@@ -315,7 +311,25 @@ func insertBroadcast(svc *youtube.Service) {
 	if err != nil {
 		log.Fatalf("Error making YouTube API call: %v", err)
 	}
-	log.Printf("after TRANSITION LiveBroadcast: %+v LiveBroadcastStatus: %+v", liveBroadcast, liveBroadcast.Status)
+	started := time.Now()
+	db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(storeBucket)
+		dat := broadcastInfo{
+			ID:    liveBroadcast.Id,
+			State: BROADCAST_LIVE,
+			Start: started,
+		}
+		serial, err := json.Marshal(dat)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = b.Put(broadcastKey, serial)
+		return err
+	})
+	log.WithFields(log.Fields{
+		"broadcastId": liveBroadcast.Id,
+		"started":     started,
+	}).Info("New broadcast started")
 }
 func valueOrFileContents(value string, filename string) string {
 	if value != "" {
