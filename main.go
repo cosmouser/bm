@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/boltdb/bolt"
 	"hash/fnv"
 	"io/ioutil"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+
 	"runtime"
 	"strings"
 	"time"
@@ -44,6 +46,12 @@ var (
 func main() {
 	flag.Parse()
 
+	db, err := bolt.Open(*dbPath, 0600, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	initLocalStore(db)
 	config := &oauth2.Config{
 		ClientID:     valueOrFileContents(*clientID, *clientIDFile),
 		ClientSecret: valueOrFileContents(*secret, *secretFile),
@@ -55,7 +63,50 @@ func main() {
 	c := newOAuthClient(ctx, config)
 	youtubeMain(c)
 }
-func insertBroadcast(svc *youtube.LiveBroadcastsService, broadcastName, description string) (*youtube.LiveBroadcast, error) {
+
+// checkLocalState checks the internal store for the LiveBroadcast status.
+// If the internal store matches YT's data then it resumes managing the current
+// stream. If it does not match, or if there is no internal data, this
+// starts a new broadcast.
+func checkLocalState(svc *youtube.LiveBroadcastsService) error {
+	return nil
+}
+
+// pollAndTransitionToLive polls the current LiveBroadcast for ready status, then
+// calls for a transition to "live" status.
+func pollAndTransitionToLive(svc *youtube.LiveBroadcastsService) {}
+func initLocalStore(db *bolt.DB) {
+	db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte("store"))
+		if err != nil {
+			return fmt.Errorf("create bucket: %s", err)
+			os.Exit(1)
+		}
+		return nil
+	})
+}
+func youtubeMain(client *http.Client) {
+
+	service, err := youtube.New(client)
+	if err != nil {
+		log.Fatalf("Unable to create YouTube service: %v", err)
+	}
+	lss := youtube.NewLiveStreamsService(service)
+	lslc := lss.List("snippet,cdn,contentDetails,status")
+	resp, err := lslc.Id("gjjfl3sUhhQ0Mfkxju5Mkg1579286304556586").Do()
+	if err != nil {
+		log.Fatalf("Error making YouTube API call: %v", err)
+	}
+	log.Printf("%+v", resp.Items[0].Id)
+	log.Printf("%+v", resp.Items[0].Snippet)
+	log.Printf("%+v", resp.Items[0].Status.HealthStatus)
+	for _, v := range resp.Items[0].Status.HealthStatus.ConfigurationIssues {
+		log.Printf("Configuration issue: %+v", v)
+	}
+	log.Printf("%+v", resp.Items[0].ContentDetails)
+
+}
+func insertBroadcast(svc *youtube.LiveBroadcastsService) (*youtube.LiveBroadcast, error) {
 	broadcastInput := &youtube.LiveBroadcast{
 		ContentDetails: &youtube.LiveBroadcastContentDetails{
 			EnableDvr:       true,
@@ -69,8 +120,8 @@ func insertBroadcast(svc *youtube.LiveBroadcastsService, broadcastName, descript
 			SelfDeclaredMadeForKids: false,
 		},
 		Snippet: &youtube.LiveBroadcastSnippet{
-			Title:              broadcastName + " | " + time.Now().Format(time.RubyDate),
-			Description:        description,
+			Title:              valueOrFileContents(*broadcastName, *broadcastNameFile) + " | " + time.Now().Format(time.RubyDate),
+			Description:        "Live stream by BroadcastManager",
 			ScheduledStartTime: time.Now().Format(time.RFC3339),
 		},
 	}
@@ -78,28 +129,9 @@ func insertBroadcast(svc *youtube.LiveBroadcastsService, broadcastName, descript
 	insertCall := svc.Insert("snippet,contentDetails,status", broadcastInput)
 	return insertCall.Do()
 }
-func youtubeMain(client *http.Client) {
-
-	service, err := youtube.New(client)
-	if err != nil {
-		log.Fatalf("Unable to create YouTube service: %v", err)
-	}
-	lss := youtube.NewLiveStreamsService(service)
-	lslc := lss.List("snippet,cdn,contentDetails,status")
-	resp, err := lslc.Mine(true).Do()
-	if err != nil {
-		log.Fatalf("Error making YouTube API call: %v", err)
-	}
-	log.Printf("%+v", resp.Items[0].Snippet)
-	log.Printf("%+v", resp.Items[0].Status.HealthStatus)
-	log.Printf("%+v", resp.Items[0].ContentDetails)
-
-}
 func testInsertBroadcastAndGoLive(svc *youtube.Service) {
 	liveBroadcastService := youtube.NewLiveBroadcastsService(svc)
-	description := "Live stream by BroadcastManager"
-	title := valueOrFileContents(*broadcastName, *broadcastNameFile)
-	liveBroadcast, err := insertBroadcast(liveBroadcastService, title, description)
+	liveBroadcast, err := insertBroadcast(liveBroadcastService)
 	if err != nil {
 		log.Fatalf("Error making YouTube API call: %v", err)
 	}
