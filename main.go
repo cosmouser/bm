@@ -45,12 +45,14 @@ var (
 	db                *bolt.DB
 	storeBucket       = []byte("store")
 	broadcastKey      = []byte("broadcast")
+	endDuration       = time.Duration(time.Minute * 30)
 )
 
 type broadcastInfo struct {
 	ID    string         `json:"id"`
 	State broadcastState `json:"state"`
 	Start time.Time      `json:"start"`
+	Last  time.Time      `json:"last"`
 }
 type broadcastState int
 
@@ -121,10 +123,11 @@ func youtubeMain(client *http.Client) {
 	switch state {
 	case BROADCAST_STARTING:
 		insertBroadcast(service)
+		broadcastManager(service)
 	case BROADCAST_LIVE:
-		log.Info("youtubeMain state is LIVE.")
+		broadcastManager(service)
 	case BROADCAST_ERROR:
-		log.Warn("youtubeMain state is ERROR.")
+		log.Warn("youtubeMain state is ERROR")
 	default:
 		log.Fatal("unexpected broadcast state")
 	}
@@ -132,8 +135,80 @@ func youtubeMain(client *http.Client) {
 
 // broadcastManager checks the status of the current broadcast regularly to manage it
 func broadcastManager(svc *youtube.Service) {
-
+	c := time.Tick(15 * time.Second)
+	for now := range c {
+		state := findLocalState()
+		switch state {
+		case BROADCAST_STARTING:
+			db.View(func(tx *bolt.Tx) error {
+				b := tx.Bucket(storeBucket)
+				v := b.Get(broadcastKey)
+				broadcast := broadcastInfo{}
+				err := json.Unmarshal(v, &broadcast)
+				if err != nil {
+					return err
+				}
+				if time.Since(broadcast.Start) > 3*time.Minute {
+					log.Warn("broadcast has been in state STARTING for over 3 minutes")
+				}
+			})
+		case BROADCAST_LIVE:
+			shouldCheck := false
+			shouldEnd := false
+			db.View(func(tx *bolt.Tx) error {
+				b := tx.Bucket(storeBucket)
+				v := b.Get(broadcastKey)
+				broadcast := broadcastInfo{}
+				err := json.Unmarshal(v, &broadcast)
+				if err != nil {
+					return err
+				}
+				if time.Since(broadcast.LastCheck) > 2*time.Minute {
+					shouldCheck = true
+				}
+			})
+			if shouldCheck {
+				shouldEnd := checkEndCondition()
+			}
+			if shouldEnd {
+				completeBroadcast(svc)
+			}
+		case BROADCAST_ERROR:
+			log.Warn("youtubeMain state is ERROR")
+		default:
+			log.Fatal("unexpected broadcast state")
+		}
+	}
 }
+func completeBroadcast(svc *youtube.Service) {}
+
+// checkEndCondition checks if the currentBroadcast has gone over the maximum duration
+func checkEndCondition() bool {
+	var result bool
+	err := db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(storeBucket)
+		v := b.Get(broadcastKey)
+		if v == nil {
+			log.Fatal("checking for end condition on non existent broadcast")
+		}
+		broadcast := broadcastInfo{}
+		err := json.Unmarshal(v, &broadcast)
+		if err != nil {
+			return err
+		}
+		broadcast.Last = time.Now()
+		serial, err := json.Marshal(broadcast)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = b.Put(broadcastKey, serial)
+		if time.Since(broadcast.Start) > endDuration {
+			result = true
+		}
+	})
+	return result
+}
+
 func liveStreamHealthCheck(svc *youtube.Service) bool {
 	lss := youtube.NewLiveStreamsService(svc)
 	lslc := lss.List("snippet,cdn,contentDetails,status")
@@ -203,6 +278,20 @@ func findState(svc *youtube.Service) (broadcastState, error) {
 		return nil
 	})
 	return state, err
+}
+func findLocalState() broadcastState {
+	var state broadcastState
+	db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(storeBucket)
+		v := b.Get(broadcastKey)
+		broadcast := broadcastInfo{}
+		err := json.Unmarshal(v, &broadcast)
+		if err != nil {
+			return err
+		}
+		state = broadcast.State
+	})
+	return state
 }
 
 // pollAndTransitionToLive polls the current LiveBroadcast for ready status, then
@@ -275,6 +364,7 @@ func insertBroadcast(svc *youtube.Service) {
 			ID:    liveBroadcast.Id,
 			State: BROADCAST_STARTING,
 			Start: time.Now(),
+			Last:  time.Now(),
 		}
 		serial, err := json.Marshal(dat)
 		if err != nil {
