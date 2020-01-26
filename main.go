@@ -93,11 +93,77 @@ func main() {
 	c := newOAuthClient(ctx, config)
 	youtubeMain(c)
 }
+func youtubeMain(client *http.Client) {
+	service, err := youtube.New(client)
+	if err != nil {
+		log.Fatalf("Unable to create YouTube service: %v", err)
+	}
+	errCount := 0
+	for !liveStreamHealthCheck(service) {
+		if errCount < 4 {
+			errCount++
+		}
+		time.Sleep(time.Duration(15*errCount) * time.Second)
+	}
+	state, err := findState(service)
+	if err != nil {
+		log.Fatalf("Error checking state: %v", err)
+	}
+	// If state is BROADCAST_STARTING, run steps to insert a new broadcast
+	// If state is BROADCAST_LIVE, go to regular status polling
+	// If state is BROADCAST_ERROR, stream is bad or unable to auth.
+	// Attempt to end stream if local ID matches external ID, then change status
+	// to BROADCAST_STARTING.
+	// If unable to end the stream, keep trying at regular intervals.
+	// With the application kept in the BROADCAST_ERROR state, prometheus
+	// should be able to alert on a problem. We don't want to start a new stream
+	// because we want to make sure the old one has been ended.
+	switch state {
+	case BROADCAST_STARTING:
+		insertBroadcast(service)
+	case BROADCAST_LIVE:
+		log.Info("youtubeMain state is LIVE.")
+	case BROADCAST_ERROR:
+		log.Warn("youtubeMain state is ERROR.")
+	default:
+		log.Fatal("unexpected broadcast state")
+	}
+}
+
+// broadcastManager checks the status of the current broadcast regularly to manage it
+func broadcastManager(svc *youtube.Service) {
+
+}
+func liveStreamHealthCheck(svc *youtube.Service) bool {
+	lss := youtube.NewLiveStreamsService(svc)
+	lslc := lss.List("snippet,cdn,contentDetails,status")
+	resp, err := lslc.Id(valueOrFileContents("", *streamIDFile)).Do()
+	if err != nil {
+		log.WithFields(log.Fields{
+			"error": err,
+		}).Fatal("Error checking liveStream health")
+	}
+	if len(resp.Items) == 0 {
+		log.WithFields(log.Fields{
+			"streamID": valueOrFileContents("", *streamIDFile),
+		}).Fatal("Stream not found")
+	}
+	if len(resp.Items[0].Status.HealthStatus.ConfigurationIssues) != 0 {
+		for _, v := range resp.Items[0].Status.HealthStatus.ConfigurationIssues {
+			log.Error(v.Description)
+		}
+		log.WithFields(log.Fields{
+			"streamID": valueOrFileContents("", *streamIDFile),
+		}).Error("The stream does not seem healthy")
+		return false
+	}
+	return true
+}
 
 // findState checks the internal store for the LiveBroadcast status.
 // If the internal store matches YT's data then it resumes managing the current
-// stream. If it does not match, or if there is no internal data, this
-// starts a new broadcast.
+// stream. If it does not match, or if there is no internal data, the result
+// can be used to start a new broadcast.
 func findState(svc *youtube.Service) (broadcastState, error) {
 	state := BROADCAST_STARTING
 	err := db.View(func(tx *bolt.Tx) error {
@@ -177,74 +243,6 @@ func pollForTransitionToLive(svc *youtube.LiveBroadcastsService) bool {
 	}
 	return false
 }
-func initLocalStore() {
-	db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists([]byte("store"))
-		if err != nil {
-			return fmt.Errorf("create bucket: %s", err)
-			os.Exit(1)
-		}
-		return nil
-	})
-}
-func youtubeMain(client *http.Client) {
-	service, err := youtube.New(client)
-	if err != nil {
-		log.Fatalf("Unable to create YouTube service: %v", err)
-	}
-	errCount := 0
-	for !liveStreamHealthCheck(service) {
-		if errCount < 4 {
-			errCount++
-		}
-		time.Sleep(time.Duration(15*errCount) * time.Second)
-	}
-	state, err := findState(service)
-	if err != nil {
-		log.Fatalf("Error checking state: %v", err)
-	}
-	// If state is BROADCAST_STARTING, run steps to insert a new broadcast
-	// If state is BROADCAST_LIVE, go to regular status polling
-	// If state is BROADCAST_ERROR, stream is bad or unable to auth.
-	// Attempt to end stream if local ID matches external ID, then change status
-	// to BROADCAST_STARTING.
-	// If unable to end the stream, keep trying at regular intervals.
-	// With the application kept in the BROADCAST_ERROR state, prometheus
-	// should be able to alert on a problem. We don't want to start a new stream
-	// because we want to make sure the old one has been ended.
-	log.WithFields(log.Fields{
-		"state": state,
-	}).Info()
-	if state == BROADCAST_STARTING {
-		insertBroadcast(service)
-	}
-
-}
-func liveStreamHealthCheck(svc *youtube.Service) bool {
-	lss := youtube.NewLiveStreamsService(svc)
-	lslc := lss.List("snippet,cdn,contentDetails,status")
-	resp, err := lslc.Id(valueOrFileContents("", *streamIDFile)).Do()
-	if err != nil {
-		log.WithFields(log.Fields{
-			"error": err,
-		}).Fatal("Error checking liveStream health")
-	}
-	if len(resp.Items) == 0 {
-		log.WithFields(log.Fields{
-			"streamID": valueOrFileContents("", *streamIDFile),
-		}).Fatal("Stream not found")
-	}
-	if len(resp.Items[0].Status.HealthStatus.ConfigurationIssues) != 0 {
-		for _, v := range resp.Items[0].Status.HealthStatus.ConfigurationIssues {
-			log.Error(v.Description)
-		}
-		log.WithFields(log.Fields{
-			"streamID": valueOrFileContents("", *streamIDFile),
-		}).Error("The stream does not seem healthy")
-		return false
-	}
-	return true
-}
 
 func insertBroadcast(svc *youtube.Service) {
 	liveBroadcastService := youtube.NewLiveBroadcastsService(svc)
@@ -286,26 +284,25 @@ func insertBroadcast(svc *youtube.Service) {
 		return err
 	})
 
-	// BIND
 	bindCall := liveBroadcastService.Bind(liveBroadcast.Id, "snippet,contentDetails,status")
 	liveBroadcast, err = bindCall.StreamId(valueOrFileContents("", *streamIDFile)).Do()
 	if err != nil {
 		log.Fatalf("Error making YouTube API call: %v", err)
 	}
 
-	// TRANSITION TO TESTING
+	// Call for a transition to testing.
 	transitionCall := liveBroadcastService.Transition("testing", liveBroadcast.Id, "snippet,status")
 	liveBroadcast, err = transitionCall.Do()
 	if err != nil {
 		log.Fatalf("Error making YouTube API call: %v", err)
 	}
 
-	// Wait for transition to complete before transitioning to live
+	// Wait for transition to complete before transitioning to live.
 	for !pollForTransitionToLive(liveBroadcastService) {
 		time.Sleep(5 * time.Second)
 	}
 
-	// TRANSITION TO LIVE
+	// Call for a transition to live.
 	transitionCall = liveBroadcastService.Transition("live", liveBroadcast.Id, "snippet,status")
 	liveBroadcast, err = transitionCall.Do()
 	if err != nil {
@@ -330,6 +327,16 @@ func insertBroadcast(svc *youtube.Service) {
 		"broadcastId": liveBroadcast.Id,
 		"started":     started,
 	}).Info("New broadcast started")
+}
+func initLocalStore() {
+	db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte("store"))
+		if err != nil {
+			return fmt.Errorf("create bucket: %s", err)
+			os.Exit(1)
+		}
+		return nil
+	})
 }
 func valueOrFileContents(value string, filename string) string {
 	if value != "" {
